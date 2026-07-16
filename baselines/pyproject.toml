@@ -23,6 +23,10 @@ dependencies = [
 fvspec = "baselines:main"
 doteval-dashboard = "viz.build:app"
 
+[project.entry-points.inspect_ai]
+avocado    = "baselines.providers.avocado"
+claude_cli = "baselines.providers.claude_cli"
+
 [build-system]
 requires = ["uv_build>=0.8.2,<0.9.0"]
 build-backend = "uv_build"

@@ -41,3 +41,16 @@ human_name = "gemini25pro"
 provider = "google"
 model_pin = "gemini-2.5-pro"
 dollars_per_output_millitoken = 10
+
+[[model]]
+human_name = "avocado514"
+provider = "avocado"
+model_pin = "avocado-5.14-agent"
+dollars_per_output_millitoken = 0.0
+
+[[model]]
+human_name = "opus48cli"
+provider = "claude_cli"
+model_pin = "claude-opus-4-8[1m]"
+supports_temperature = false
+dollars_per_output_millitoken = 0.0
