@@ -39,3 +39,30 @@ def test_avocado_provider_returns_model_output():
         )
     assert out.choices[0].message.text == "hello world"
     assert out.usage.total_tokens == 7
+
+
+def test_avocado_tools_payload_strips_nulls():
+    from baselines.providers.avocado import _tools_to_openai
+
+    class _ToolInfo:
+        name = "write_lean_spec"
+        description = "write to Spec.lean"
+
+        class _Params:
+            @staticmethod
+            def model_dump(**_):
+                # Simulates a pydantic dump with unset Optional fields = None.
+                return {
+                    "type": "object",
+                    "properties": {"content": {"type": "string", "default": None}},
+                    "required": None,
+                    "additionalProperties": None,
+                }
+
+        parameters = _Params()
+
+    out = _tools_to_openai([_ToolInfo()])
+    assert out[0]["function"]["parameters"] == {
+        "type": "object",
+        "properties": {"content": {"type": "string"}},
+    }

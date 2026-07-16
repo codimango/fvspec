@@ -200,17 +200,32 @@ def _messages_to_openai(input: list[ChatMessage]) -> list[dict[str, Any]]:
 
 
 def _tools_to_openai(tools: list[ToolInfo]) -> list[dict[str, Any]]:
-    return [
-        {
+    out = []
+    for t in tools:
+        params = (
+            t.parameters.model_dump(exclude_none=True)
+            if hasattr(t.parameters, "model_dump")
+            else t.parameters
+        )
+        out.append({
             "type": "function",
             "function": {
                 "name": t.name,
                 "description": t.description,
-                "parameters": t.parameters.model_dump() if hasattr(t.parameters, "model_dump") else t.parameters,
+                "parameters": _strip_nulls(params),
             },
-        }
-        for t in tools
-    ]
+        })
+    return out
+
+
+def _strip_nulls(obj: Any) -> Any:
+    """Recursively drop None-valued keys and None list items. Meta AI Gateway's
+    schema validator rejects explicit nulls where a typed value is expected."""
+    if isinstance(obj, dict):
+        return {k: _strip_nulls(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [_strip_nulls(v) for v in obj if v is not None]
+    return obj
 
 
 @modelapi(name="avocado")
