@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import random
+import re
 import subprocess
 from typing import Any
 
@@ -20,14 +22,14 @@ from inspect_ai.model import (
     ModelUsage,
     modelapi,
 )
+from inspect_ai.solver._task_state import sample_state
 from inspect_ai.tool import ToolCall, ToolChoice, ToolInfo
 
-# Reuse the text-parse-and-write shim from claude_cli. Avocado's OpenAI-compat
-# endpoint does not emit `tool_calls` — the model returns prose even when a
-# `tools` payload is present and `tool_choice="required"` is set (verified by
-# direct probe). So we mirror opus's one-shot behavior: extract the last ```lean
-# block from the response and write it to <workspace>/Fvspec/Spec.lean.
-from baselines.providers.claude_cli import _write_spec_from_output
+# Reuse the text-parse-and-write shim plus workspace lookup from claude_cli.
+# Avocado's OpenAI-compat endpoint does not emit `tool_calls` — the model
+# returns prose even when a `tools` payload is present and
+# `tool_choice="required"` is set (verified by direct probe).
+from baselines.providers.claude_cli import _current_workspace, _write_spec_from_output
 
 
 # Whitelist of stop-reason strings inspect-ai's Literal accepts. Vendor-specific
@@ -50,6 +52,8 @@ _DEFAULT_CERT = "/var/facebook/x509_identities/server.pem"
 # which truncates every fvspec response mid-first-theorem. Explicit high default
 # lets the model actually finish; if config.max_tokens is set, we honor that.
 _DEFAULT_MAX_TOKENS = 32768
+_DEFAULT_REFINEMENTS = 2
+logger = logging.getLogger(__name__)
 
 
 class AvocadoAPI(ModelAPI):
@@ -64,6 +68,7 @@ class AvocadoAPI(ModelAPI):
         client_cert: str = _DEFAULT_CERT,
         reasoning_effort: str = "xhigh",
         timeout: int = 1800,
+        refinements: int = _DEFAULT_REFINEMENTS,
     ) -> None:
         super().__init__(
             model_name=model_name,
@@ -75,6 +80,7 @@ class AvocadoAPI(ModelAPI):
         self._client_cert = client_cert
         self._reasoning_effort = reasoning_effort
         self._timeout = timeout
+        self._refinements = refinements
 
     async def generate(
         self,
@@ -83,26 +89,103 @@ class AvocadoAPI(ModelAPI):
         tool_choice: ToolChoice,
         config: GenerateConfig,
     ) -> ModelOutput:
-        payload = self._build_payload(input, tools, tool_choice, config)
-        response, err = await self._call_with_retries(payload)
-        if err or response is None:
-            raise RuntimeError(f"avocado call failed: {err}")
-        out = self._response_to_output(response)
-        # avocado ignores the `tools` payload; write the last ```lean block from
-        # the model's text response into Spec.lean so lake_build_scorer sees it.
-        _write_spec_from_output(out.choices[0].message.text)
-        return out
+        try:
+            messages = _messages_to_openai(input)
+            last_error: str | None = None
+            last_output: ModelOutput | None = None
+            attempts_used = 0
+            self._record_attempt_state(attempts_used=0, last_error=None)
+
+            for attempt in range(self._refinements + 1):
+                attempts_used = attempt + 1
+                self._record_attempt_state(
+                    attempts_used=attempts_used,
+                    last_error=last_error,
+                )
+                payload = self._build_payload(messages, tools, tool_choice, config)
+                response, err = await self._call_with_retries(payload)
+                if err or response is None:
+                    logger.error(
+                        "avocado call failed; continuing with empty output: %s",
+                        err,
+                    )
+                    self._record_attempt_state(
+                        attempts_used=attempts_used,
+                        last_error=err,
+                    )
+                    return self._error_output(f"avocado call failed: {err}")
+
+                out = self._response_to_output(response)
+                last_output = out
+                content = out.choices[0].message.text
+                # avocado ignores the `tools` payload; write the last ```lean
+                # block from the model's text response into Spec.lean so
+                # lake_build_scorer sees it.
+                _write_spec_from_output(content)
+                ok, error = await asyncio.to_thread(self._evaluate_workspace)
+                if ok:
+                    if attempts_used > 1:
+                        logger.warning(
+                            "avocado completed after %d model attempts",
+                            attempts_used,
+                        )
+                    self._record_attempt_state(
+                        attempts_used=attempts_used,
+                        last_error=None,
+                    )
+                    return out
+
+                last_error = error
+                self._record_attempt_state(
+                    attempts_used=attempts_used,
+                    last_error=last_error,
+                )
+                if attempt < self._refinements:
+                    logger.warning(
+                        "avocado attempt %d failed; retrying with compile feedback: %s",
+                        attempt + 1,
+                        last_error,
+                    )
+                    messages = self._build_refinement_messages(
+                        messages,
+                        content,
+                        last_error or "Unknown error",
+                    )
+
+            assert last_output is not None
+            self._record_attempt_state(
+                attempts_used=attempts_used,
+                last_error=last_error,
+            )
+            return last_output
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("avocado generate crashed; continuing with empty output")
+            return self._error_output("avocado generate crashed")
+
+    def _error_output(self, message: str) -> ModelOutput:
+        return ModelOutput(
+            model=self.model_name,
+            choices=[
+                ChatCompletionChoice(
+                    message=ChatMessageAssistant(content=f"[avocado error] {message}"),
+                    stop_reason="unknown",
+                )
+            ],
+            usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
+        )
 
     def _build_payload(
         self,
-        input: list[ChatMessage],
+        messages: list[dict[str, Any]],
         tools: list[ToolInfo],
         tool_choice: ToolChoice,
         config: GenerateConfig,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model_name,
-            "messages": _messages_to_openai(input),
+            "messages": messages,
             "reasoning_effort": self._reasoning_effort,
             "max_tokens": config.max_tokens if config.max_tokens is not None else _DEFAULT_MAX_TOKENS,
         }
@@ -191,6 +274,80 @@ class AvocadoAPI(ModelAPI):
                 total_tokens=usage.get("total_tokens", 0),
             ),
         )
+
+    def _evaluate_workspace(self) -> tuple[bool, str | None]:
+        workspace = _current_workspace()
+        if workspace is None:
+            return True, None
+
+        spec_file = workspace / "Fvspec" / "Spec.lean"
+        if not spec_file.exists():
+            return False, "No Spec.lean was written."
+
+        spec_content = spec_file.read_text()
+        sorries = len(re.findall(r"\bsorry\b", spec_content))
+        if sorries > 0:
+            return False, f"The candidate still contains {sorries} `sorry` placeholder(s)."
+
+        try:
+            result = subprocess.run(
+                ["lake", "build"],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "lake build timed out after 120s."
+        except Exception as e:
+            return False, f"lake build failed to run: {e}"
+
+        combined = (result.stdout or "") + "\n" + (result.stderr or "")
+        if result.returncode == 0 and "declaration uses 'sorry'" not in combined:
+            return True, None
+
+        error_text = (result.stderr or result.stdout or "").strip()
+        if not error_text:
+            error_text = f"lake build failed with return code {result.returncode}"
+        return False, error_text[:2000]
+
+    def _record_attempt_state(
+        self,
+        *,
+        attempts_used: int,
+        last_error: str | None,
+    ) -> None:
+        state = sample_state()
+        if state is None:
+            return
+        state.metadata["avocado_model_attempts"] = attempts_used
+        state.metadata["avocado_refinements_used"] = max(0, attempts_used - 1)
+        state.metadata["avocado_max_refinements"] = self._refinements
+        if last_error:
+            state.metadata["avocado_last_checker_error"] = last_error
+        else:
+            state.metadata.pop("avocado_last_checker_error", None)
+
+    def _build_refinement_messages(
+        self,
+        messages: list[dict[str, Any]],
+        previous_output: str,
+        error_message: str,
+    ) -> list[dict[str, Any]]:
+        return [
+            *messages,
+            {"role": "assistant", "content": previous_output},
+            {
+                "role": "user",
+                "content": (
+                    "Your previous attempt did not satisfy the checker.\n\n"
+                    "Checker feedback:\n"
+                    f"{error_message}\n\n"
+                    "Revise the Lean proof/spec accordingly. Return only a single ```lean fenced block "
+                    "containing the full updated Spec.lean contents."
+                ),
+            },
+        ]
 
 
 def _messages_to_openai(input: list[ChatMessage]) -> list[dict[str, Any]]:

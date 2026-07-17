@@ -14,6 +14,7 @@ partial stdout on timeout.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import subprocess
 import threading
@@ -32,12 +33,14 @@ from inspect_ai.model import (
 from inspect_ai.solver._task_state import sample_state
 from inspect_ai.tool import ToolChoice, ToolInfo
 
+logger = logging.getLogger(__name__)
 
 _CLI_PREAMBLE_MARKERS = (
     "Claude Code at Meta",
     "Using AI Gateway",
     "Warning: no stdin",
 )
+_DEFAULT_REFINEMENTS = 2
 
 _LEAN_BLOCK_RE = re.compile(
     r"```(?:lean4?|Lean4?|LEAN4?)[^\n]*\n(.*?)```",
@@ -57,6 +60,16 @@ def _strip_cli_preamble(text: str) -> str:
 def _last_lean_block(text: str) -> str | None:
     blocks = _LEAN_BLOCK_RE.findall(text or "")
     return blocks[-1].strip() if blocks else None
+
+
+def _current_workspace() -> Path | None:
+    state = sample_state()
+    if state is None:
+        return None
+    workspace_path = state.metadata.get("workspace")
+    if not workspace_path:
+        return None
+    return Path(workspace_path)
 
 
 def _run_cli_blocking(
@@ -139,6 +152,7 @@ class ClaudeCLIAPI(ModelAPI):
         *,
         cli: str = "claude",
         timeout: int = 3600,
+        refinements: int = _DEFAULT_REFINEMENTS,
     ) -> None:
         super().__init__(
             model_name=model_name,
@@ -149,6 +163,7 @@ class ClaudeCLIAPI(ModelAPI):
         )
         self._cli = cli
         self._timeout = timeout
+        self._refinements = refinements
 
     async def generate(
         self,
@@ -159,12 +174,97 @@ class ClaudeCLIAPI(ModelAPI):
     ) -> ModelOutput:
         # tools are ignored — the CLI runs its own internal tool loop opaquely.
         prompt = _messages_to_prompt(input)
-        content, timed_out = await asyncio.to_thread(self._run_cli, prompt)
+        content = ""
+        timed_out = False
+        last_error: str | None = None
+
+        for attempt in range(self._refinements + 1):
+            if attempt > 0:
+                prompt = self._build_refinement_prompt(prompt, content, last_error or "Unknown error")
+                logger.info(
+                    "claude_cli refinement attempt %d/%d",
+                    attempt,
+                    self._refinements,
+                )
+
+            content, timed_out = await asyncio.to_thread(self._run_cli, prompt)
+            if timed_out and not content:
+                last_error = f"claude CLI timed out after {self._timeout}s"
+            else:
+                _write_spec_from_output(content)
+                ok, error = await asyncio.to_thread(self._evaluate_workspace)
+                if ok:
+                    return self._model_output(content, timed_out)
+                last_error = error
+
+            if attempt < self._refinements:
+                logger.info(
+                    "claude_cli attempt %d failed; retrying with compile feedback: %s",
+                    attempt + 1,
+                    last_error,
+                )
+
         if timed_out and not content:
-            raise RuntimeError(f"claude CLI timed out after {self._timeout}s")
-        # write shim: put the extracted lean block into Spec.lean so
-        # lake_build_scorer sees it without any inspect-ai tool_call round-trip.
-        _write_spec_from_output(content)
+            raise RuntimeError(last_error or f"claude CLI timed out after {self._timeout}s")
+        return self._model_output(content, timed_out)
+
+    def _run_cli(self, prompt: str) -> tuple[str, bool]:
+        """Instance wrapper so tests can patch `api._run_cli`."""
+        return _run_cli_blocking(prompt, self.model_name, self._cli, self._timeout)
+
+    def _evaluate_workspace(self) -> tuple[bool, str | None]:
+        workspace = _current_workspace()
+        if workspace is None:
+            return True, None
+
+        spec_file = workspace / "Fvspec" / "Spec.lean"
+        if not spec_file.exists():
+            return False, "No Spec.lean was written."
+
+        spec_content = spec_file.read_text()
+        sorries = len(re.findall(r"\bsorry\b", spec_content))
+        if sorries > 0:
+            return False, f"The candidate still contains {sorries} `sorry` placeholder(s)."
+
+        try:
+            result = subprocess.run(
+                ["lake", "build"],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "lake build timed out after 120s."
+        except Exception as e:
+            return False, f"lake build failed to run: {e}"
+
+        combined = (result.stdout or "") + "\n" + (result.stderr or "")
+        if result.returncode == 0 and "declaration uses 'sorry'" not in combined:
+            return True, None
+
+        error_text = (result.stderr or result.stdout or "").strip()
+        if not error_text:
+            error_text = f"lake build failed with return code {result.returncode}"
+        return False, error_text[:2000]
+
+    def _build_refinement_prompt(
+        self,
+        base_prompt: str,
+        previous_output: str,
+        error_message: str,
+    ) -> str:
+        return (
+            f"{base_prompt}\n\n"
+            "Your previous attempt did not satisfy the checker.\n\n"
+            "Previous answer:\n"
+            f"{previous_output}\n\n"
+            "Checker feedback:\n"
+            f"{error_message}\n\n"
+            "Revise the Lean proof/spec accordingly. Return only a single ```lean fenced block containing the full updated Spec.lean contents."
+        )
+
+    def _model_output(self, content: str, timed_out: bool) -> ModelOutput:
         return ModelOutput(
             model=self.model_name,
             choices=[
@@ -175,10 +275,6 @@ class ClaudeCLIAPI(ModelAPI):
             ],
             usage=ModelUsage(input_tokens=0, output_tokens=0, total_tokens=0),
         )
-
-    def _run_cli(self, prompt: str) -> tuple[str, bool]:
-        """Instance wrapper so tests can patch `api._run_cli`."""
-        return _run_cli_blocking(prompt, self.model_name, self._cli, self._timeout)
 
 
 @modelapi(name="claude_cli")
