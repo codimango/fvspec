@@ -22,6 +22,13 @@ from inspect_ai.model import (
 )
 from inspect_ai.tool import ToolCall, ToolChoice, ToolInfo
 
+# Reuse the text-parse-and-write shim from claude_cli. Avocado's OpenAI-compat
+# endpoint does not emit `tool_calls` — the model returns prose even when a
+# `tools` payload is present and `tool_choice="required"` is set (verified by
+# direct probe). So we mirror opus's one-shot behavior: extract the last ```lean
+# block from the response and write it to <workspace>/Fvspec/Spec.lean.
+from baselines.providers.claude_cli import _write_spec_from_output
+
 
 # Whitelist of stop-reason strings inspect-ai's Literal accepts. Vendor-specific
 # values ("error", "eos", "safety", ...) would otherwise crash pydantic validation.
@@ -39,6 +46,10 @@ def _normalize_stop_reason(raw: str | None) -> str:
 
 _DEFAULT_URL = "https://metacode-modelapi.ai-gateway.fbinfra.net/v1/chat/completions"
 _DEFAULT_CERT = "/var/facebook/x509_identities/server.pem"
+# The AI Gateway silently defaults max_tokens=128 when the field is omitted,
+# which truncates every fvspec response mid-first-theorem. Explicit high default
+# lets the model actually finish; if config.max_tokens is set, we honor that.
+_DEFAULT_MAX_TOKENS = 32768
 
 
 class AvocadoAPI(ModelAPI):
@@ -76,7 +87,11 @@ class AvocadoAPI(ModelAPI):
         response, err = await self._call_with_retries(payload)
         if err or response is None:
             raise RuntimeError(f"avocado call failed: {err}")
-        return self._response_to_output(response)
+        out = self._response_to_output(response)
+        # avocado ignores the `tools` payload; write the last ```lean block from
+        # the model's text response into Spec.lean so lake_build_scorer sees it.
+        _write_spec_from_output(out.choices[0].message.text)
+        return out
 
     def _build_payload(
         self,
@@ -89,9 +104,8 @@ class AvocadoAPI(ModelAPI):
             "model": self.model_name,
             "messages": _messages_to_openai(input),
             "reasoning_effort": self._reasoning_effort,
+            "max_tokens": config.max_tokens if config.max_tokens is not None else _DEFAULT_MAX_TOKENS,
         }
-        if config.max_tokens is not None:
-            payload["max_tokens"] = config.max_tokens
         if config.temperature is not None:
             payload["temperature"] = config.temperature
         if tools:
